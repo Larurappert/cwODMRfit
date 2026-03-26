@@ -134,8 +134,6 @@ def finalize_plot(
     return fig, ax
 
 
-# %%
-
 
 R2_MIN = 0.5
 
@@ -150,10 +148,10 @@ POSITION_X_COORDS = {
     4: 45,
 }
 
-before_base = os.path.join()
-after_base  = os.path.join()
+before_base = os.path.join(r"path_to_data_before_waveguides")
+after_base  = os.path.join(r"Path_to_save_after_waveguides")
 
-output_dir = os.path.join()
+output_dir = os.path.join(r"path_to_output")
 os.makedirs(output_dir, exist_ok=True)
 
 # Only these MW powers contribute to the strain-like observables
@@ -168,7 +166,7 @@ CONTRAST_POWER_FALLBACK = -5
 D_PAR_GHZ_PER_STRAIN  = 20.60  # axial
 D_PERP_GHZ_PER_STRAIN = 9.38   # transverse
 
-# Effective elastic scale (only the effective metric !!!!!!!!!)
+# Effective elastic scale 
 C_EFF_PA = 1.076e12  # Pa ~ C11
 
 # X axis range 
