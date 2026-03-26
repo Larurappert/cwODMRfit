@@ -1,0 +1,1323 @@
+# %%
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator, AutoMinorLocator
+
+from scipy.optimize import curve_fit
+from scipy.signal import savgol_filter, find_peaks
+from scipy.special import voigt_profile
+import pandas as pd
+import os
+import glob
+import re
+
+
+CUSTOM_COLORS = [
+    "#D4004E",
+    "#B13C77",  # dusty rose
+    "#E8A0BF",  # soft pink
+    "#A3AEFA",  # soft periwinkle
+    "#4ECDC4",  # soft teal
+    "#9D4EDD",  # gentle violet
+    "#494E94",  # muted blue
+]
+
+COLOR_BEFORE = "#B13C77"   # dusty rose
+COLOR_AFTER  = "#E8A0BF"   # soft pink
+COLOR_SERIES_1 = "#9D4EDD"  # gentle violet
+COLOR_SERIES_2 = "#A3AEFA"  # soft periwinkle
+COLOR_SERIES_3 = "#494E94"  # muted blue
+
+
+def _apply_rcparams(font_size: int):
+    mpl.rcParams.update({
+        "font.size": font_size,
+        "axes.labelsize": font_size,
+        "axes.titlesize": font_size + 1,
+        "xtick.labelsize": font_size - 1,
+        "ytick.labelsize": font_size - 1,
+        "legend.fontsize": font_size - 1,
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "DejaVu Sans", "Helvetica"],
+    })
+
+
+def setup_plot_style(
+    figsize=(3.5, 2.5),
+    font_size=9,
+    use_grid=False,
+    dpi=300,
+    x_decimals=3,
+    y_decimals=2,
+    nbins=6,
+):
+    _apply_rcparams(font_size)
+
+    plt.style.use("seaborn-v0_8-white")
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+    ax.set_prop_cycle(color=CUSTOM_COLORS)
+
+    for s in ["top", "right", "bottom", "left"]:
+        ax.spines[s].set_visible(True)
+
+    ax.tick_params(
+        which="major",
+        direction="in",
+        length=4,
+        width=0.8,
+        top=True,
+        bottom=True,
+        left=True,
+        right=True,
+        labeltop=False,
+        labelright=False,
+    )
+
+    ax.minorticks_on()
+    ax.tick_params(
+        which="minor",
+        direction="in",
+        length=2,
+        width=0.6,
+        top=True,
+        bottom=True,
+        left=True,
+        right=True,
+    )
+
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+
+    ax.xaxis.set_major_formatter(FormatStrFormatter(f"%.{x_decimals}f"))
+    ax.yaxis.set_major_formatter(FormatStrFormatter(f"%.{y_decimals}f"))
+
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=nbins))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=nbins))
+
+    ax.grid(use_grid)
+    return fig, ax
+
+
+def finalize_plot(
+    fig,
+    ax,
+    xlabel="",
+    ylabel="",
+    title="",
+    show_legend=True,
+    legend_loc="upper left",
+    legend_ncol=2,
+):
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+
+    if show_legend:
+        legend = ax.legend(
+            loc=legend_loc,
+            frameon=True,
+            fancybox=True,
+            shadow=False,
+            framealpha=0.35,
+            ncol=legend_ncol,
+        )
+        legend.get_frame().set_facecolor("0.98")
+        legend.get_frame().set_edgecolor("0.35")
+        legend.get_frame().set_linewidth(0.8)
+
+    fig.tight_layout()
+    return fig, ax
+
+
+# %%
+
+
+R2_MIN = 0.5
+
+
+base_path = 
+WAVEGUIDE = 
+
+POSITION_X_COORDS = {
+    1: 5,
+    2: 15,   
+    3: 35,
+    4: 45,
+}
+
+before_base = os.path.join()
+after_base  = os.path.join()
+
+output_dir = os.path.join()
+os.makedirs(output_dir, exist_ok=True)
+
+# Only these MW powers contribute to the strain-like observables
+POWERS_FOR_STRAIN  = [0, -5]
+POWER_FOR_T2       = -5
+
+#If 0 is missing, only -5 is used.
+CONTRAST_POWER_PRIMARY = 0
+CONTRAST_POWER_FALLBACK = -5
+
+# Spin-strain couplings (GHz per "strain") from the Acham paper
+D_PAR_GHZ_PER_STRAIN  = 20.60  # axial
+D_PERP_GHZ_PER_STRAIN = 9.38   # transverse
+
+# Effective elastic scale (only the effective metric !!!!!!!!!)
+C_EFF_PA = 1.076e12  # Pa ~ C11
+
+# X axis range 
+X_MIN_UM = 0.0
+X_MAX_UM = 50.0
+
+print(f"WAVEGUIDE: {WAVEGUIDE}")
+print(f"POWERS_FOR_STRAIN (ONLY these): {POWERS_FOR_STRAIN}")
+print(f"R² quality cut: R² >= {R2_MIN:.2f}")
+print(f"CONTRAST power: prefer {CONTRAST_POWER_PRIMARY} dBm, else {CONTRAST_POWER_FALLBACK} dBm (per position, per before/after)")
+print("POSITION MAPPING (Po -> x in µm):")
+for pos, x_coord in sorted(POSITION_X_COORDS.items()):
+    print(f"  Po {pos} -> x = {x_coord} µm")
+
+
+def finite_mask(*arrs):
+    m = np.ones_like(np.asarray(arrs[0]), dtype=bool)
+    for a in arrs:
+        a = np.asarray(a)
+        m &= np.isfinite(a)
+    return m
+
+
+def weighted_mean(values, sigmas):
+    """
+    Inverse-variance weighted mean.
+    Returns (mean, sigma_mean). Falls back to simple mean if sigmas invalid.
+    """
+    v = np.asarray(values, dtype=float)
+    s = np.asarray(sigmas, dtype=float)
+
+    m = np.isfinite(v) & np.isfinite(s) & (s > 0)
+    if np.sum(m) >= 1:
+        w = 1.0 / (s[m] ** 2)
+        mu = np.sum(w * v[m]) / np.sum(w)
+        sigma_mu = np.sqrt(1.0 / np.sum(w))
+        return float(mu), float(sigma_mu)
+
+    m2 = np.isfinite(v)
+    if np.sum(m2) == 0:
+        return np.nan, np.nan
+    mu = float(np.mean(v[m2]))
+    sigma_mu = float(np.std(v[m2])) if np.sum(m2) > 1 else np.nan
+    return mu, sigma_mu
+
+
+def conservative_err(pcov_err, std_over_powers):
+    """
+    pcov_err from curve_fit can be overly optimistic.
+    thesis-safe: err_final = max(pcov_err, std_over_powers)
+    """
+    candidates = []
+    if np.isfinite(pcov_err) and pcov_err > 0:
+        candidates.append(float(pcov_err))
+    if np.isfinite(std_over_powers) and std_over_powers > 0:
+        candidates.append(float(std_over_powers))
+    if not candidates:
+        return np.nan
+    return float(np.max(candidates))
+
+
+def set_y_limits_with_errorbars(ax, y_list, yerr_list=None,
+                               pad_low_frac=0.12, pad_high_frac=0.80,
+                               manual_limits=None):
+    """
+    Includes all points + errorbars; adds extra headroom above.
+    """
+    if manual_limits is not None:
+        ax.set_ylim(*manual_limits)
+        return
+
+    ymins, ymaxs = [], []
+
+    if yerr_list is None:
+        yerr_list = [None] * len(y_list)
+
+    for y, ye in zip(y_list, yerr_list):
+        if y is None:
+            continue
+        y = np.asarray(y, dtype=float)
+        mask = np.isfinite(y)
+
+        if ye is not None:
+            ye = np.asarray(ye, dtype=float)
+            mask &= np.isfinite(ye)
+            if np.any(mask):
+                y_low = y[mask] - np.abs(ye[mask])
+                y_high = y[mask] + np.abs(ye[mask])
+                ymins.append(np.min(y_low))
+                ymaxs.append(np.max(y_high))
+        else:
+            if np.any(mask):
+                ymins.append(np.min(y[mask]))
+                ymaxs.append(np.max(y[mask]))
+
+    if not ymins or not ymaxs:
+        return
+
+    ymin = float(np.min(ymins))
+    ymax = float(np.max(ymaxs))
+
+    yr = ymax - ymin
+    if yr <= 0:
+        yr = max(abs(ymax), 1.0)
+
+    ax.set_ylim(ymin - pad_low_frac * yr, ymax + pad_high_frac * yr)
+
+
+def apply_x_axis_um(ax):
+    ax.set_xlim(X_MIN_UM, X_MAX_UM)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+
+
+def mhz_to_ghz(x_mhz):
+    return x_mhz / 1e3
+
+
+def eps_par_from_deltaD_mhz(deltaD_mhz):
+    if not np.isfinite(deltaD_mhz):
+        return np.nan
+    return mhz_to_ghz(deltaD_mhz) / D_PAR_GHZ_PER_STRAIN
+
+
+def eps_perp_from_deltaE_mhz(deltaE_mhz):
+    if not np.isfinite(deltaE_mhz):
+        return np.nan
+    return mhz_to_ghz(deltaE_mhz) / D_PERP_GHZ_PER_STRAIN
+
+
+def sigma_mpa_from_eps(eps):
+    if not np.isfinite(eps):
+        return np.nan
+    return (C_EFF_PA * eps) / 1e6
+
+
+def eps_hydro(eps_par, eps_perp):
+    if not (np.isfinite(eps_par) and np.isfinite(eps_perp)):
+        return np.nan
+    return (eps_par + 2.0 * eps_perp) / 3.0
+
+
+def u_eff_j_m3_from_delta_eps(delta_eps_par, delta_eps_perp):
+    if not (np.isfinite(delta_eps_par) and np.isfinite(delta_eps_perp)):
+        return np.nan
+    return 0.5 * C_EFF_PA * (delta_eps_par**2 + 2.0 * delta_eps_perp**2)
+
+
+def eps_err_from_mhz_err(delta_mhz_err, coupling_ghz_per_strain):
+    if not np.isfinite(delta_mhz_err) or delta_mhz_err < 0:
+        return np.nan
+    return mhz_to_ghz(delta_mhz_err) / coupling_ghz_per_strain
+
+
+def u_err_from_delta_eps(delta_eps_par, delta_eps_perp, delta_eps_par_err, delta_eps_perp_err):
+    if not (np.isfinite(delta_eps_par) and np.isfinite(delta_eps_perp)
+            and np.isfinite(delta_eps_par_err) and np.isfinite(delta_eps_perp_err)):
+        return np.nan
+    du2 = (C_EFF_PA * delta_eps_par)**2 * (delta_eps_par_err**2) + (2.0 * C_EFF_PA * delta_eps_perp)**2 * (delta_eps_perp_err**2)
+    return float(np.sqrt(du2))
+
+
+
+
+# Reference for axial shift:
+D_GS_GHZ = 2.870  # GHz
+
+# Fit-Window
+FIT_MIN = 2.858   # GHz
+FIT_MAX = 2.883   # GHz
+
+
+NORMALIZE_TO_BASELINE = True
+USE_POISSON_CHI2 = True
+
+
+EXPECTED_C0_GHZ = 2.8705      # expected midpoint (used as anchor/fallback)
+MAX_SPLITTING_MHZ = 6.0       # HARD physical/expected cap (splitting = |c2-c1|)
+MIN_SPLITTING_MHZ = 0.2
+
+# Extra guard to make sure it actually works and doesnt fail in the harder cases like Lotta 
+C2_UPPER_GHZ = 2.874
+
+# Quality:
+MIN_CONTRAST_PERCENT = 0.02
+
+
+#FIt Model used 
+def voigt_dip(freq, amp, center, sigma, gamma):
+    prof = voigt_profile(freq - center, sigma, gamma)
+    prof_max = voigt_profile(0.0, sigma, gamma)
+    return amp * prof / prof_max
+
+
+def model_voigt_c0d(freq, A1, c0, d, s1, g1, A2, s2, g2, b0, slope):
+   
+    c1 = c0 - d
+    c2 = c0 + d
+    base = b0 + slope * (freq - c0)
+    d1 = voigt_dip(freq, A1, c1, s1, g1)
+    d2 = voigt_dip(freq, A2, c2, s2, g2)
+    return base - d1 - d2
+
+
+# =========================
+# FIT ONE FILE  (CURRENT VERSION)
+# =========================
+def fit_single_odmr_file(filename, fit_min=FIT_MIN, fit_max=FIT_MAX, verbose=False):
+   
+    basename = os.path.basename(filename)
+
+    try:
+        # ---------- load (robust) ----------
+        data = None
+        for skip in [22, 20, 18, 24, 26, 0]:
+            try:
+                data_try = np.loadtxt(filename, skiprows=skip)
+                if data_try.ndim == 2 and data_try.shape[1] >= 2 and len(data_try) > 50:
+                    data = data_try
+                    break
+            except Exception:
+                continue
+
+        if data is None:
+            if verbose:
+                print(f"[{basename}] WARNING: file format not recognized")
+            return None
+
+        frequency = data[:, 0] / 1e9  # GHz
+        counts_raw = data[:, 1]
+
+        # ---------- baseline normalize ----------
+        N_base = max(5, int(0.1 * len(counts_raw)))
+        baseline = np.mean(counts_raw[:N_base])
+        if baseline == 0 or not np.isfinite(baseline):
+            baseline = np.mean(counts_raw)
+
+        counts = (counts_raw / baseline) if NORMALIZE_TO_BASELINE else counts_raw.copy()
+
+        # ---------- fit window ----------
+        mask = (frequency >= fit_min) & (frequency <= fit_max)
+        x = frequency[mask]
+        y = counts[mask]
+        counts_raw_fit = counts_raw[mask]
+
+        if len(x) < 10:
+            if verbose:
+                print(f"[{basename}] WARNING: too few points in fit window ({len(x)})")
+            return None
+
+        # ---------- smoothing ----------
+        win_len = min(11, len(y)//2*2 - 1)
+        if win_len < 5:
+            win_len = 5 if len(y) >= 5 else max(3, len(y) - (1 - len(y) % 2))
+        y_smooth = savgol_filter(y, window_length=win_len, polyorder=2) if win_len >= 3 else y.copy()
+
+        # ---------- dip finding ----------
+        amp = float(np.max(y_smooth) - np.min(y_smooth))
+        if amp <= 0 or not np.isfinite(amp):
+            amp = float(np.max(y_smooth))
+
+        peaks = None
+        for rel_prom in [0.2, 0.1, 0.05, 0.02, 0.01]:
+            try:
+                peaks_try, _ = find_peaks(-y_smooth, prominence=rel_prom * amp, distance=3)
+            except Exception:
+                peaks_try = np.array([], dtype=int)
+            if len(peaks_try) >= 2:
+                peaks = peaks_try
+                break
+
+        # fallback: take two lowest points (still may be garbage in single-dip data)
+        if peaks is None or len(peaks) < 2:
+            idx_sorted = np.argsort(y_smooth)
+            if len(idx_sorted) >= 2:
+                peaks = np.sort(idx_sorted[:2])
+            else:
+                peaks = np.array([], dtype=int)
+
+        # Build c0/d guesses
+        if len(peaks) >= 2:
+            if len(peaks) > 2:
+                peaks = peaks[np.argsort(y_smooth[peaks])[:2]]
+            peaks = np.sort(peaks)
+
+            c_guess_1 = float(x[peaks[0]])
+            c_guess_2 = float(x[peaks[1]])
+
+            dx = float(np.median(np.diff(x))) if len(x) > 1 else 0.0005
+            if abs(c_guess_2 - c_guess_1) < 2 * dx:
+                mid = 0.5 * (c_guess_1 + c_guess_2)
+                c_guess_1 = mid - 1.5 * dx
+                c_guess_2 = mid + 1.5 * dx
+
+            c0_guess = 0.5 * (c_guess_1 + c_guess_2)
+            d_guess = 0.5 * abs(c_guess_2 - c_guess_1)
+        else:
+            # hard anchor fallback (your guidance)
+            c0_guess = float(np.clip(EXPECTED_C0_GHZ, fit_min, fit_max))
+            d_guess = 0.0015  # 3 MHz splitting
+
+        # ---------- initial guesses ----------
+        b0_guess = float(np.percentile(y, 90))
+        if not np.isfinite(b0_guess) or b0_guess <= 0:
+            b0_guess = float(np.max(y))
+
+        slope_guess = (y[-1] - y[0]) / (x[-1] - x[0]) if x[-1] != x[0] else 0.0
+
+        if len(peaks) >= 2:
+            dip_depth_1 = b0_guess - float(y_smooth[peaks[0]])
+            dip_depth_2 = b0_guess - float(y_smooth[peaks[1]])
+        else:
+            dip_depth_1 = b0_guess - float(np.min(y_smooth))
+            dip_depth_2 = dip_depth_1
+
+        A1_guess = max(dip_depth_1, b0_guess * 0.01, 1e-3)
+        A2_guess = max(dip_depth_2, b0_guess * 0.01, 1e-3)
+
+        width_est = max(d_guess / 3.0, 0.0003)  # GHz
+        s1_guess = float(np.clip(width_est, 0.0003, 0.01))
+        g1_guess = float(np.clip(width_est, 0.0003, 0.01))
+        s2_guess = s1_guess
+        g2_guess = g1_guess
+
+        # ---------- bounds (HARD enforce splitting <= 6 MHz) ----------
+        # splitting = 2d -> d_max = (MAX_SPLITTING_MHZ/2) in MHz -> /1000 to GHz
+        d_max_ghz = (MAX_SPLITTING_MHZ / 2.0) / 1e3  # 6 MHz -> 0.003 GHz
+        d_max_ghz = float(np.clip(d_max_ghz, 0.0005, 0.03))
+
+        # params: A1, c0, d, s1, g1, A2, s2, g2, b0, slope
+        lb = [
+            0.0,      fit_min,  0.0,        0.0001, 0.0001,
+            0.0,      0.0001,   0.0001,     0.0,    -200.0
+        ]
+        ub = [
+            b0_guess * 10.0,  fit_max,  d_max_ghz,  0.03,   0.03,
+            b0_guess * 10.0,  0.03,     0.03,       b0_guess * 5.0,  200.0
+        ]
+
+        # clip guesses into bounds
+        c0_guess = float(np.clip(c0_guess, fit_min, fit_max))
+        d_guess = float(np.clip(d_guess, 0.0001, 0.95 * d_max_ghz))
+        slope_guess = float(np.clip(slope_guess, lb[-1] * 0.9, ub[-1] * 0.9))
+
+        p0 = [
+            A1_guess, c0_guess, d_guess, s1_guess, g1_guess,
+            A2_guess, s2_guess, g2_guess,
+            b0_guess, slope_guess
+        ]
+
+        def attempt_fit(p0_local, maxfev=250000):
+            popt, pcov = curve_fit(
+                model_voigt_c0d, x, y, p0=p0_local,
+                bounds=(lb, ub),
+                maxfev=maxfev,
+                ftol=1e-8, xtol=1e-8
+            )
+            return popt, pcov
+
+        # ---------- fit with fallback anchored at EXPECTED_C0_GHZ ----------
+        try:
+            popt, pcov = attempt_fit(p0)
+        except Exception:
+            c0_fb = float(np.clip(EXPECTED_C0_GHZ, fit_min, fit_max))
+            d_fb = float(min(0.0015, 0.95 * d_max_ghz))
+            A_fb = max(0.01 * b0_guess, 1e-2)
+            p0_fb = [A_fb, c0_fb, d_fb, 0.001, 0.001,
+                     A_fb, 0.001, 0.001,
+                     b0_guess, 0.0]
+            try:
+                popt, pcov = attempt_fit(p0_fb)
+            except Exception:
+                return None
+
+        (A1, c0, d, s1, g1, A2, s2, g2, b0, slope) = popt
+        c1 = c0 - d
+        c2 = c0 + d
+
+        # ---------- diagnostics ----------
+        fit_curve = model_voigt_c0d(x, *popt)
+        residuals = y - fit_curve
+
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((y - np.mean(y))**2)
+        r_square = 1 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+        dof = max(len(x) - len(popt), 1)
+        chi2_red = ss_res / dof
+
+        chi2_poisson = np.nan
+        if USE_POISSON_CHI2:
+            scale_back = baseline if NORMALIZE_TO_BASELINE else 1.0
+            model_raw = fit_curve * scale_back
+            data_raw = counts_raw_fit
+            sigma_p = np.sqrt(np.clip(data_raw, 1.0, None))
+            chi2_poisson = np.sum(((data_raw - model_raw) / sigma_p) ** 2) / dof
+
+        # widths / T2*
+        fwhm_g1 = 2.355 * s1 * 1e3
+        fwhm_g2 = 2.355 * s2 * 1e3
+        fwhm_l1 = 2.0 * g1 * 1e3
+        fwhm_l2 = 2.0 * g2 * 1e3
+
+        def safe_T2_from_fwhm(fwhm_mhz):
+            if fwhm_mhz <= 0 or not np.isfinite(fwhm_mhz):
+                return np.nan
+            return 1.0 / (np.pi * fwhm_mhz * 1e6) * 1e6  # µs
+
+        T2_gauss = np.nanmean([safe_T2_from_fwhm(fwhm_g1), safe_T2_from_fwhm(fwhm_g2)])
+        T2_lorentz = np.nanmean([safe_T2_from_fwhm(fwhm_l1), safe_T2_from_fwhm(fwhm_l2)])
+
+        D_eff = float(c0)
+        splitting_mhz = float(2.0 * d * 1e3)
+        transverse_mhz = float(d * 1e3)           # E = splitting/2
+        axial_mhz = float((D_eff - D_GS_GHZ) * 1e3)
+
+        # contrast/asymmetry
+        mean_contrast = ((A1 + A2) / (2 * b0)) * 100 if b0 != 0 else np.nan
+        A_low, A_high = (min(A1, A2), max(A1, A2))
+        denomA = (A_high + A_low)
+        dip_asym = (A_high - A_low) / denomA if denomA > 0 else np.nan
+        dip_ratio = (A_high / A_low) if (A_low > 0 and np.isfinite(A_low)) else np.nan
+
+        denom_gl = (fwhm_l1 + fwhm_l2)
+        gl_ratio = (fwhm_g1 + fwhm_g2) / denom_gl if denom_gl > 0 else np.nan
+
+        var_c0 = float(pcov[1, 1]) if (pcov is not None and np.isfinite(pcov[1, 1])) else np.nan
+        var_d  = float(pcov[2, 2]) if (pcov is not None and np.isfinite(pcov[2, 2])) else np.nan
+
+        axial_mhz_err = (1e3 * np.sqrt(var_c0)) if np.isfinite(var_c0) and var_c0 >= 0 else np.nan
+        transverse_mhz_err = (1e3 * np.sqrt(var_d)) if np.isfinite(var_d) and var_d >= 0 else np.nan
+        splitting_mhz_err = (2e3 * np.sqrt(var_d)) if np.isfinite(var_d) and var_d >= 0 else np.nan
+
+        bad = False
+        bad_reasons = []
+
+        if not np.isfinite(c0) or not np.isfinite(d):
+            bad = True
+            bad_reasons.append("non-finite c0/d")
+
+        if (c2 > C2_UPPER_GHZ):
+            bad = True
+            bad_reasons.append(f"c2={c2:.6f} > {C2_UPPER_GHZ:.6f} GHz")
+
+        if (splitting_mhz < MIN_SPLITTING_MHZ) or (splitting_mhz > MAX_SPLITTING_MHZ):
+            bad = True
+            bad_reasons.append(f"splitting={splitting_mhz:.3f} MHz out of [{MIN_SPLITTING_MHZ},{MAX_SPLITTING_MHZ}]")
+
+        if np.isfinite(mean_contrast) and (mean_contrast < MIN_CONTRAST_PERCENT):
+            bad = True
+            bad_reasons.append(f"contrast={mean_contrast:.4f}% < {MIN_CONTRAST_PERCENT}%")
+
+        if bad:
+            if verbose:
+                print(f"[{basename}] FAILOVER (keep axial only). Reasons: " + "; ".join(bad_reasons))
+            transverse_mhz = np.nan
+            transverse_mhz_err = np.nan
+            splitting_mhz = np.nan
+            splitting_mhz_err = np.nan
+            c1 = np.nan
+            c2 = np.nan
+
+        return {
+            "axial_mhz": axial_mhz,
+            "axial_mhz_err": axial_mhz_err,
+
+            "transverse_mhz": transverse_mhz,
+            "transverse_mhz_err": transverse_mhz_err,
+
+            "splitting_mhz": splitting_mhz,
+            "splitting_mhz_err": splitting_mhz_err,
+
+            "contrast": mean_contrast,
+            "dip_asym": dip_asym,
+            "dip_ratio": dip_ratio,
+
+            "D_eff": D_eff,
+            "T2_gauss": T2_gauss,
+            "T2_lorentz": T2_lorentz,
+            "T2": T2_gauss,
+            "fwhm_g": (fwhm_g1 + fwhm_g2) / 2,
+            "fwhm_l": (fwhm_l1 + fwhm_l2) / 2,
+            "gl_ratio": gl_ratio,
+
+            "r2": r_square,
+            "chi2": chi2_red,
+            "chi2_poiss": chi2_poisson,
+
+            "c0": float(c0),
+            "d": float(d),
+            "c1": float(c1),
+            "c2": float(c2),
+
+            "baseline_counts": float(baseline),
+
+            "x": x,
+            "y": y,
+            "fit": fit_curve,
+            "residuals": residuals,
+        }
+
+    except Exception as e:
+        if verbose:
+            print(f"[{basename}] ERROR in fit:", str(e))
+        return None
+
+# %%
+
+def find_positions(base_folder):
+    if not os.path.exists(base_folder):
+        return []
+    positions = []
+    for item in os.listdir(base_folder):
+        item_path = os.path.join(base_folder, item)
+        if not os.path.isdir(item_path):
+            continue
+        m = re.search(r"po[\s_-]?(\d+)", item, re.IGNORECASE)
+        if m:
+            pos_number = int(m.group(1))
+            positions.append((pos_number, item_path))
+    positions.sort(key=lambda x: x[0])
+    return positions
+
+
+
+def choose_contrast_result(results_by_power: dict):
+    def valid(res):
+        if res is None:
+            return False
+        r2_val = res.get("r2", np.nan)
+        return (np.isfinite(r2_val) and (r2_val >= R2_MIN))
+
+    # preferred
+    if CONTRAST_POWER_PRIMARY in results_by_power and valid(results_by_power[CONTRAST_POWER_PRIMARY]):
+        return CONTRAST_POWER_PRIMARY, results_by_power[CONTRAST_POWER_PRIMARY]
+
+    # fallback
+    if CONTRAST_POWER_FALLBACK in results_by_power and valid(results_by_power[CONTRAST_POWER_FALLBACK]):
+        return CONTRAST_POWER_FALLBACK, results_by_power[CONTRAST_POWER_FALLBACK]
+
+    # any
+    for p in sorted(results_by_power.keys()):
+        if valid(results_by_power[p]):
+            return p, results_by_power[p]
+
+    return None, {}
+
+
+def process_position(position_folder):
+    files = glob.glob(os.path.join(position_folder, "*range0.dat"))
+    if len(files) == 0:
+        print("  WARNING: no files found")
+        return None
+
+    print(f"  Found: {len(files)} files")
+
+    results_by_power = {}
+    for f in files:
+        bn = os.path.basename(f).lower()
+        m = re.search(r"([+-]?\d+)\s?dbm", bn)
+        if not m:
+            continue
+        power = float(m.group(1))
+
+        print(f"    {power:>4.0f} dBm: ", end="")
+        res = fit_single_odmr_file(f, FIT_MIN, FIT_MAX, verbose=False)
+        if res is None:
+            print("FAIL")
+            continue
+
+        r2_val = res.get("r2", np.nan)
+        if (not np.isfinite(r2_val)) or (r2_val < R2_MIN):
+            print(f"REJECT (R²={r2_val:.3f} < {R2_MIN:.2f})")
+            continue
+
+        results_by_power[power] = res
+        print(f"OK  E⊥={res['transverse_mhz']:.2f} MHz, Ez={res['axial_mhz']:+.2f} MHz, R²={r2_val:.3f}")
+
+    if len(results_by_power) == 0:
+        return None
+
+    # Aggregate across selected powers  (only the ones that cam by quality cut)
+    axial_vals  = [results_by_power[p]["axial_mhz"] for p in POWERS_FOR_STRAIN if p in results_by_power]
+    axial_errs  = [results_by_power[p]["axial_mhz_err"] for p in POWERS_FOR_STRAIN if p in results_by_power]
+    trans_vals  = [results_by_power[p]["transverse_mhz"] for p in POWERS_FOR_STRAIN if p in results_by_power]
+    trans_errs  = [results_by_power[p]["transverse_mhz_err"] for p in POWERS_FOR_STRAIN if p in results_by_power]
+
+    axial_mean, axial_mean_err_w = weighted_mean(axial_vals, axial_errs)
+    trans_mean, trans_mean_err_w = weighted_mean(trans_vals, trans_errs)
+
+    axial_std_over_powers = np.std(axial_vals) if len(axial_vals) > 1 else 0.0
+    trans_std_over_powers = np.std(trans_vals) if len(trans_vals) > 1 else 0.0
+
+    axial_mean_err = conservative_err(axial_mean_err_w, axial_std_over_powers)
+    trans_mean_err = conservative_err(trans_mean_err_w, trans_std_over_powers)
+
+    # T2/quality metrics at chosen power (fallback: any surviving power)
+    res_q = results_by_power.get(POWER_FOR_T2, None)
+    if res_q is None:
+        res_q = list(results_by_power.values())[0]
+
+    splitting_mhz_q = res_q.get("splitting_mhz", np.nan)
+    splitting_mhz_q_err = res_q.get("splitting_mhz_err", np.nan)
+
+    # >>> NEW: contrast selection with per-position fallback (0 -> -5)
+    contrast_power_used, res_c = choose_contrast_result(results_by_power)
+    baseline_counts = res_c.get("baseline_counts", np.nan)
+
+    return {
+        "axial_mhz": axial_mean,
+        "axial_mhz_err": axial_mean_err,
+        "axial_std_over_powers": axial_std_over_powers,
+
+        "transverse_mhz": trans_mean,                # E = splitting/2
+        "transverse_mhz_err": trans_mean_err,
+        "trans_std_over_powers": trans_std_over_powers,
+
+        "splitting_mhz_q": splitting_mhz_q,
+        "splitting_mhz_q_err": splitting_mhz_q_err,
+
+        "strain_n": len(trans_vals),
+
+        "contrast": res_c.get("contrast", np.nan),
+        "dip_asym": res_c.get("dip_asym", np.nan),
+        "dip_ratio": res_c.get("dip_ratio", np.nan),
+        "contrast_power_used": float(contrast_power_used) if contrast_power_used is not None else np.nan,
+
+        "baseline": baseline_counts,
+
+        "r2": res_q.get("r2", np.nan),
+        "chi2": res_q.get("chi2", np.nan),
+        "chi2_poiss": res_q.get("chi2_poiss", np.nan),
+
+        "n_powers": len(results_by_power),
+    }
+
+
+
+# %%
+
+pos_before = find_positions(before_base)
+pos_after  = find_positions(after_base)
+
+print(f"Positions BEFORE: {[p[0] for p in pos_before]}")
+print(f"Positions AFTER : {[p[0] for p in pos_after]}")
+
+results_before = []
+results_after  = []
+
+print("\n" + "="*100)
+print("PROCESSING BEFORE TRANSFER")
+print("="*100)
+for pos_num, pos_path in pos_before:
+    print(f"\nPo {pos_num}:")
+    res = process_position(pos_path)
+    if res:
+        res["position"] = pos_num
+        res["x_coord"] = float(POSITION_X_COORDS.get(pos_num, pos_num))
+        results_before.append(res)
+
+print("\n" + "="*100)
+print("PROCESSING AFTER TRANSFER")
+print("="*100)
+for pos_num, pos_path in pos_after:
+    print(f"\nPo {pos_num}:")
+    res = process_position(pos_path)
+    if res:
+        res["position"] = pos_num
+        res["x_coord"] = float(POSITION_X_COORDS.get(pos_num, pos_num))
+        results_after.append(res)
+
+df_before = pd.DataFrame(results_before)
+df_after  = pd.DataFrame(results_after)
+
+print(f"\nOK: {len(df_before)} positions BEFORE, {len(df_after)} positions AFTER\n")
+
+df = df_before.merge(
+    df_after,
+    on=["position", "x_coord"],
+    suffixes=("_before", "_after"),
+    how="outer"   # <-- WICHTIG
+)
+
+output_file = os.path.join(output_dir, f"{WAVEGUIDE}_complete_ODMR_analysis.xlsx")
+
+with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+    df_before.to_excel(writer, sheet_name="Before_Transfer", index=False)
+    df_after.to_excel(writer, sheet_name="After_Transfer", index=False)
+    df.to_excel(writer, sheet_name="Merged", index=False)
+
+print(f"Complete analysis saved to: {output_file}")
+
+
+
+
+# %%
+
+df["d_axial_mhz"]     = df["axial_mhz_after"] - df["axial_mhz_before"]
+df["d_axial_mhz_err"] = np.sqrt(df["axial_mhz_err_after"]**2 + df["axial_mhz_err_before"]**2)
+
+df["d_transverse_mhz"]     = df["transverse_mhz_after"] - df["transverse_mhz_before"]
+df["d_transverse_mhz_err"] = np.sqrt(df["transverse_mhz_err_after"]**2 + df["transverse_mhz_err_before"]**2)
+
+df["d_eps_par"]     = df["d_axial_mhz"].apply(eps_par_from_deltaD_mhz)
+df["d_eps_par_err"] = df["d_axial_mhz_err"].apply(lambda s: eps_err_from_mhz_err(s, D_PAR_GHZ_PER_STRAIN))
+
+df["d_eps_perp"]     = df["d_transverse_mhz"].apply(eps_perp_from_deltaE_mhz)
+df["d_eps_perp_err"] = df["d_transverse_mhz_err"].apply(lambda s: eps_err_from_mhz_err(s, D_PERP_GHZ_PER_STRAIN))
+
+df["d_sigma_par_mpa"]     = df["d_eps_par"].apply(sigma_mpa_from_eps)
+df["d_sigma_par_mpa_err"] = df["d_eps_par_err"].apply(sigma_mpa_from_eps)
+
+df["d_sigma_perp_mpa"]     = df["d_eps_perp"].apply(sigma_mpa_from_eps)
+df["d_sigma_perp_mpa_err"] = df["d_eps_perp_err"].apply(sigma_mpa_from_eps)
+
+df["d_eps_hyd"] = df.apply(lambda r: eps_hydro(r["d_eps_par"], r["d_eps_perp"]), axis=1)
+df["d_eps_hyd_err"] = np.sqrt((1/3.0)**2 * df["d_eps_par_err"]**2 + (2/3.0)**2 * df["d_eps_perp_err"]**2)
+
+df["d_sigma_hyd_mpa"]     = df["d_eps_hyd"].apply(sigma_mpa_from_eps)
+df["d_sigma_hyd_mpa_err"] = df["d_eps_hyd_err"].apply(sigma_mpa_from_eps)
+
+df["d_u_j_m3"] = df.apply(lambda r: u_eff_j_m3_from_delta_eps(r["d_eps_par"], r["d_eps_perp"]), axis=1)
+df["d_u_j_m3_err"] = df.apply(lambda r: u_err_from_delta_eps(
+    r["d_eps_par"], r["d_eps_perp"], r["d_eps_par_err"], r["d_eps_perp_err"]
+), axis=1)
+
+
+# %%
+
+def fmt_pm(val, err, decimals=3):
+    if not np.isfinite(val):
+        return "nan"
+    if err is None or (not np.isfinite(err)):
+        return f"{val:.{decimals}f}"
+    return f"{val:.{decimals}f}±{err:.{decimals}f}"
+
+
+out = pd.DataFrame({
+    "Position": [f"Po {p}" for p in df["position"]],
+    "x (µm)": df["x_coord"],
+
+    "E⊥ BEFORE (MHz)": df.apply(lambda r: fmt_pm(r["transverse_mhz_before"], r["transverse_mhz_err_before"], 3), axis=1),
+    "E⊥ AFTER (MHz)" : df.apply(lambda r: fmt_pm(r["transverse_mhz_after"],  r["transverse_mhz_err_after"],  3), axis=1),
+    "ΔE⊥ (MHz)"      : df.apply(lambda r: fmt_pm(r["d_transverse_mhz"], r["d_transverse_mhz_err"], 3), axis=1),
+
+    "Ez BEFORE (MHz)": df.apply(lambda r: fmt_pm(r["axial_mhz_before"], r["axial_mhz_err_before"], 3), axis=1),
+    "Ez AFTER (MHz)" : df.apply(lambda r: fmt_pm(r["axial_mhz_after"],  r["axial_mhz_err_after"],  3), axis=1),
+    "ΔEz (MHz)"      : df.apply(lambda r: fmt_pm(r["d_axial_mhz"], r["d_axial_mhz_err"], 3), axis=1),
+
+    "Splitting@Q BEFORE (MHz)": df["splitting_mhz_q_before"].round(3),
+    "Splitting@Q AFTER (MHz)" : df["splitting_mhz_q_after"].round(3),
+
+    "Contrast BEFORE (%)": df["contrast_before"].round(2),
+    "Contrast AFTER (%)" : df["contrast_after"].round(2),
+
+    # NEW: show which power was actually used for contrast per position
+    "Contrast power BEFORE (dBm)": df["contrast_power_used_before"].round(0),
+    "Contrast power AFTER (dBm)" : df["contrast_power_used_after"].round(0),
+
+    "Baseline BEFORE": df["baseline_before"].round(0),
+    "Baseline AFTER" : df["baseline_after"].round(0),
+
+    "R² BEFORE": df["r2_before"].round(3),
+    "R² AFTER" : df["r2_after"].round(3),
+
+    "Δε⊥ (×1e-6)"       : (df["d_eps_perp"] * 1e6).round(2),
+    "Δε⊥ err (×1e-6)"   : (df["d_eps_perp_err"] * 1e6).round(2),
+    "Δε∥ (×1e-6)"       : (df["d_eps_par"]  * 1e6).round(2),
+    "Δε∥ err (×1e-6)"   : (df["d_eps_par_err"] * 1e6).round(2),
+    "Δε_hyd (×1e-6)"    : (df["d_eps_hyd"]  * 1e6).round(2),
+    "Δε_hyd err (×1e-6)": (df["d_eps_hyd_err"] * 1e6).round(2),
+
+    "Δσ⊥ (MPa)"         : df["d_sigma_perp_mpa"].round(2),
+    "Δσ⊥ err (MPa)"     : df["d_sigma_perp_mpa_err"].round(2),
+    "Δσ∥ (MPa)"         : df["d_sigma_par_mpa"].round(2),
+    "Δσ∥ err (MPa)"     : df["d_sigma_par_mpa_err"].round(2),
+    "Δσ_hyd (MPa)"      : df["d_sigma_hyd_mpa"].round(2),
+    "Δσ_hyd err (MPa)"  : df["d_sigma_hyd_mpa_err"].round(2),
+
+    "Δu_eff metric (J/m³)"      : df["d_u_j_m3"].apply(lambda x: f"{x:.2e}" if np.isfinite(x) else "nan"),
+    "Δu_eff metric err (J/m³)"  : df["d_u_j_m3_err"].apply(lambda x: f"{x:.2e}" if np.isfinite(x) else "nan"),
+})
+
+out.to_csv(os.path.join(output_dir, f"{WAVEGUIDE}_comparison_DIFF_physics.csv"), index=False)
+df.to_csv(os.path.join(output_dir, f"{WAVEGUIDE}_full_data_DIFF_physics.csv"), index=False)
+
+try:
+    out.to_latex(os.path.join(output_dir, f"{WAVEGUIDE}_comparison_DIFF_physics.tex"), index=False)
+except Exception:
+    pass
+
+print("\nOK: tables exported:")
+print(f"  {os.path.join(output_dir, f'{WAVEGUIDE}_comparison_DIFF_physics.csv')}")
+print(f"  {os.path.join(output_dir, f'{WAVEGUIDE}_full_data_DIFF_physics.csv')}")
+
+
+# %%
+
+x_coords = df["x_coord"].values.astype(float)
+x_range = (max(x_coords) - min(x_coords)) if len(x_coords) > 1 else 1.0
+offset = max(0.03 * x_range, 0.18)
+
+# ABS arrays
+Eperp_before      = df["transverse_mhz_before"].values
+Eperp_after       = df["transverse_mhz_after"].values
+Eperp_before_err  = df["transverse_mhz_err_before"].values
+Eperp_after_err   = df["transverse_mhz_err_after"].values
+
+Ez_before      = df["axial_mhz_before"].values
+Ez_after       = df["axial_mhz_after"].values
+Ez_before_err  = df["axial_mhz_err_before"].values
+Ez_after_err   = df["axial_mhz_err_after"].values
+
+contrast_before = df["contrast_before"].values
+contrast_after  = df["contrast_after"].values
+
+baseline_before = df["baseline_before"].values
+baseline_after  = df["baseline_after"].values
+
+r2_before = df["r2_before"].values
+r2_after  = df["r2_after"].values
+
+# Δ arrays
+d_Eperp = df["d_transverse_mhz"].values
+d_Eperp_err = df["d_transverse_mhz_err"].values
+
+d_Ez = df["d_axial_mhz"].values
+d_Ez_err = df["d_axial_mhz_err"].values
+
+d_sig_perp = df["d_sigma_perp_mpa"].values
+d_sig_perp_err = df["d_sigma_perp_mpa_err"].values
+
+d_sig_par = df["d_sigma_par_mpa"].values
+d_sig_par_err = df["d_sigma_par_mpa_err"].values
+
+d_sig_h = df["d_sigma_hyd_mpa"].values
+d_sig_h_err = df["d_sigma_hyd_mpa_err"].values
+
+d_u = df["d_u_j_m3"].values
+d_u_err = df["d_u_j_m3_err"].values
+
+
+# Plot 1: ABbs E_perp (MHz)
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=2, nbins=6, use_grid=False)
+
+m1 = finite_mask(x_coords, Eperp_before, Eperp_before_err)
+m2 = finite_mask(x_coords, Eperp_after,  Eperp_after_err)
+
+ax.errorbar(x_coords[m1] - offset, Eperp_before[m1], yerr=Eperp_before_err[m1],
+            fmt="o", linestyle="none", capsize=3, label="BEFORE", color=COLOR_BEFORE)
+ax.errorbar(x_coords[m2] + offset, Eperp_after[m2], yerr=Eperp_after_err[m2],
+            fmt="s", linestyle="none", capsize=3, label="AFTER", color=COLOR_AFTER)
+
+apply_x_axis_um(ax)
+set_y_limits_with_errorbars(ax, [Eperp_before[m1], Eperp_after[m2]],
+                            [Eperp_before_err[m1], Eperp_after_err[m2]])
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Transverse $E_\\perp$ (MHz)",
+              title=f"{WAVEGUIDE}: ABSOLUTE $E_\\perp$ (display only)",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_ABS_Eperp_MHz.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# Plot 2: ABS Ez (MHz)
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=2, nbins=6, use_grid=False)
+
+m1 = finite_mask(x_coords, Ez_before, Ez_before_err)
+m2 = finite_mask(x_coords, Ez_after,  Ez_after_err)
+
+ax.errorbar(x_coords[m1] - offset, Ez_before[m1], yerr=Ez_before_err[m1],
+            fmt="o", linestyle="none", capsize=3, label="BEFORE", color=COLOR_BEFORE)
+ax.errorbar(x_coords[m2] + offset, Ez_after[m2], yerr=Ez_after_err[m2],
+            fmt="s", linestyle="none", capsize=3, label="AFTER", color=COLOR_AFTER)
+
+ax.axhline(0, linewidth=1)
+apply_x_axis_um(ax)
+
+set_y_limits_with_errorbars(ax, [Ez_before[m1], Ez_after[m2]],
+                            [Ez_before_err[m1], Ez_after_err[m2]])
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Axial $E_z$ (MHz)",
+              title=f"{WAVEGUIDE}: ABSOLUTE $E_z$ (display only)",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_ABS_Ez_MHz.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# Plot 3:  Differences in Hz
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=2, nbins=6, use_grid=False)
+
+m_ep = finite_mask(x_coords, d_Eperp, d_Eperp_err)
+m_ez = finite_mask(x_coords, d_Ez, d_Ez_err)
+
+ax.axhline(0, linewidth=1)
+ax.errorbar(x_coords[m_ep] - offset, d_Eperp[m_ep], yerr=d_Eperp_err[m_ep],
+            fmt="o", linestyle="none", capsize=3,
+            label="Δ$E_\\perp$ (MHz)", color=COLOR_SERIES_1)
+
+ax.errorbar(x_coords[m_ez] + offset, d_Ez[m_ez], yerr=d_Ez_err[m_ez],
+            fmt="s", linestyle="none", capsize=3,
+            label="Δ$E_z$ (MHz)", color=COLOR_SERIES_2)
+
+apply_x_axis_um(ax)
+set_y_limits_with_errorbars(ax, [d_Eperp[m_ep], d_Ez[m_ez]],
+                            [d_Eperp_err[m_ep], d_Ez_err[m_ez]])
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Δ (MHz)",
+              title=f"{WAVEGUIDE}: DIFFERENCES (AFTER − BEFORE) in MHz",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_DIFF_MHz.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# Plot 4: effective stress diference in MPA
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=2, nbins=6, use_grid=False)
+
+m1 = finite_mask(x_coords, d_sig_perp, d_sig_perp_err)
+m2 = finite_mask(x_coords, d_sig_par,  d_sig_par_err)
+m3 = finite_mask(x_coords, d_sig_h,    d_sig_h_err)
+
+ax.axhline(0, linewidth=1)
+ax.errorbar(x_coords[m1] - offset, d_sig_perp[m1], yerr=d_sig_perp_err[m1],
+            fmt="o", linestyle="none", capsize=3,
+            label="Δ$\\sigma_\\perp$ (MPa)", color=COLOR_SERIES_1)
+
+ax.errorbar(x_coords[m2], d_sig_par[m2], yerr=d_sig_par_err[m2],
+            fmt="s", linestyle="none", capsize=3,
+            label="Δ$\\sigma_\\parallel$ (MPa)", color=COLOR_SERIES_2)
+
+ax.errorbar(x_coords[m3] + offset, d_sig_h[m3], yerr=d_sig_h_err[m3],
+            fmt="^", linestyle="none", capsize=3,
+            label="Δ$\\sigma_\\mathrm{hyd}$ (MPa)", color=COLOR_SERIES_3)
+
+apply_x_axis_um(ax)
+set_y_limits_with_errorbars(ax,
+                            [d_sig_perp[m1], d_sig_par[m2], d_sig_h[m3]],
+                            [d_sig_perp_err[m1], d_sig_par_err[m2], d_sig_h_err[m3]])
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Δσ (MPa)",
+              title=f"{WAVEGUIDE}: effective stress scale from Δ only",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_DIFF_stress_MPa.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# Plot 5: effective difference in energy in diamond (Not really neede, but might be interesting )
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=1, nbins=6, use_grid=False)
+
+m = finite_mask(x_coords, d_u, d_u_err)
+
+ax.axhline(0, linewidth=1)
+ax.errorbar(x_coords[m], d_u[m], yerr=d_u_err[m],
+            fmt="o", linestyle="none", capsize=3, label="Δ$u_\\mathrm{eff}$ metric (J/m³)", color=COLOR_SERIES_1)
+
+apply_x_axis_um(ax)
+set_y_limits_with_errorbars(ax, [d_u[m]], [d_u_err[m]])
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Δ$u_\\mathrm{eff}$ (J/m³)",
+              title=f"{WAVEGUIDE}: effective Δu metric from Δ only",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_DIFF_energy_Jm3.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# contrast
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=2, nbins=6, use_grid=False)
+
+m1 = finite_mask(x_coords, contrast_before)
+m2 = finite_mask(x_coords, contrast_after)
+
+ax.plot(x_coords[m1] - offset, contrast_before[m1], "o", linestyle="none", label="BEFORE", color=COLOR_BEFORE)
+ax.plot(x_coords[m2] + offset, contrast_after[m2],  "s", linestyle="none", label="AFTER",  color=COLOR_AFTER)
+
+apply_x_axis_um(ax)
+set_y_limits_with_errorbars(ax, [contrast_before[m1], contrast_after[m2]], None)
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Contrast (%)",
+              title=f"{WAVEGUIDE}: ABSOLUTE contrast (auto: 0 → -5 per position)",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_ABS_contrast.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# Baseline counts absolute
+fig, ax = setup_plot_style(figsize=(4, 2.5), dpi=300, x_decimals=0, y_decimals=0, nbins=6, use_grid=False)
+
+m1 = finite_mask(x_coords, baseline_before)
+m2 = finite_mask(x_coords, baseline_after)
+
+ax.plot(x_coords[m1] - offset, baseline_before[m1], "o", linestyle="none", label="BEFORE", color=COLOR_BEFORE)
+ax.plot(x_coords[m2] + offset, baseline_after[m2],  "s", linestyle="none", label="AFTER",  color=COLOR_AFTER)
+
+apply_x_axis_um(ax)
+set_y_limits_with_errorbars(ax, [baseline_before[m1], baseline_after[m2]], None)
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="Baseline (counts)",
+              title=f"{WAVEGUIDE}: ABSOLUTE baseline (same power as contrast)",
+              show_legend=True, legend_loc="upper right", legend_ncol=1)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_ABS_baseline.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+
+# Plt  von Residuls
+fig, ax = setup_plot_style(figsize=(4, 3), dpi=300, x_decimals=0, y_decimals=2, nbins=6, use_grid=False)
+
+m1 = finite_mask(x_coords, r2_before)
+m2 = finite_mask(x_coords, r2_after)
+
+bar_width = 0.9
+ax.bar(x_coords[m1] - 0.5*bar_width, r2_before[m1], width=bar_width, label="BEFORE", alpha=0.85, color=COLOR_BEFORE)
+ax.bar(x_coords[m2] + 0.5*bar_width, r2_after[m2],  width=bar_width, label="AFTER",  alpha=0.85, color=COLOR_AFTER)
+
+ax.axhline(0.95, linestyle="--", linewidth=1, alpha=0.6, label="0.95", color=COLOR_SERIES_2)
+ax.axhline(0.70, linestyle="--", linewidth=1, alpha=0.6, label="0.70", color=COLOR_SERIES_3)
+
+ax.set_ylim(0.65, 1.10)
+apply_x_axis_um(ax)
+
+finalize_plot(fig, ax,
+              xlabel="Position along waveguide (µm)",
+              ylabel="$R^2$",
+              title=f"{WAVEGUIDE}: ABSOLUTE fit quality",
+              show_legend=True, legend_loc="upper right", legend_ncol=2)
+
+fig.savefig(os.path.join(output_dir, f"{WAVEGUIDE}_ABS_r2.png"), dpi=300, bbox_inches="tight")
+plt.show()
+
+print("\nOK: plots saved in:")
+print(f"  {output_dir}")
+
+
+
+def fit_and_plot_file(filepath):
+    """
+    Fit one ODMR file and automatically plot:
+    - data + fit
+    - residuals
+    - vertical lines at dip centers
+    """
+
+    res = fit_single_odmr_file(
+        filepath,
+        fit_min=FIT_MIN,
+        fit_max=FIT_MAX,
+        verbose=True
+    )
+
+    if res is None:
+        print("Fit failed.")
+        return None
+
+    print("\n=== SINGLE FILE FIT RESULT ===")
+    print(f"File: {filepath}")
+    print(f"R²: {res['r2']:.4f}")
+    print(f"Ez (axial): {res['axial_mhz']:+.3f} ± {res['axial_mhz_err']:.3f} MHz")
+    print(f"E⊥ (transverse): {res['transverse_mhz']:+.3f} ± {res['transverse_mhz_err']:.3f} MHz")
+    print(f"Splitting: {res['splitting_mhz']:.3f} ± {res['splitting_mhz_err']:.3f} MHz")
+    print(f"Contrast: {res['contrast']:.2f} %")
+    print(f"T2* (Gauss proxy): {res['T2_gauss']:.3f} µs")
+    print(f"chi2_red: {res['chi2']:.3g}")
+    print(f"chi2_poiss: {res['chi2_poiss']:.3g}")
+
+    # Dip centers 
+    c1 = res["c1"]
+    c2 = res["c2"]
+
+    # fit+plots
+    fig, ax = setup_plot_style(
+        figsize=(4.6, 2.8),
+        dpi=200,
+        x_decimals=4,
+        y_decimals=3,
+        nbins=6,
+        use_grid=False
+    )
+
+    ax.plot(res["x"], res["y"], ".", label="data")
+    ax.plot(res["x"], res["fit"], "-", label="fit")
+
+    # vertical dip markers for better look
+    if np.isfinite(c1):
+        ax.axvline(c1, linestyle="--", linewidth=0.5, color =  "#8C5CB3" )
+    if np.isfinite(c2):
+        ax.axvline(c2, linestyle="--", linewidth=0.5, color =  "#8C5CB3")
+
+    finalize_plot(
+        fig, ax,
+        xlabel="Frequency (GHz)",
+        ylabel="Normalized counts" if NORMALIZE_TO_BASELINE else "Counts",
+        title="Single ODMR fit",
+        show_legend=True,
+        legend_loc="upper right",
+        legend_ncol=1
+    )
+    plt.show()
+
+    fig, ax = setup_plot_style(
+        figsize=(4.6, 2.1),
+        dpi=200,
+        x_decimals=4,
+        y_decimals=4,
+        nbins=6,
+        use_grid=False
+    )
+
+    ax.axhline(0, linewidth=1)
+    ax.plot(res["x"], res["residuals"], ".")
+
+    finalize_plot(
+        fig, ax,
+        xlabel="Frequency (GHz)",
+        ylabel="Residual",
+        title="Residuals",
+        show_legend=False
+    )
+    plt.show()
+
+    return res
+
+
+file_path = r''
+fit_and_plot_file(file_path)
+
+
+
+
+
+
+
+
+
