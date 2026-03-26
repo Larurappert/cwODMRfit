@@ -9,6 +9,6 @@ For every waveguide the exakt Position (from 0-50 Mikrometer) hast to be put in 
 
 The fitting is set up to be with automatic peak detection, sensible parameter limits, and simple quality checks. 
 
-The analysis is done for selected microwave powers, and the final values are averaged with conservative error estimates.
+The analysis is done for the selected microwave powers, that can be chosen, and the final values are averaged.
 
-The code also calculates some derived quantities like effective strain, stress, and an energy density metric, and automatically creates plots and comparison data (e.g. before and after transfer of the waveguide structures).
+The code also calculates quantities like effective strain, stress, and an energy density metric, and it automatically creates plots and comparison data to compare the induced changes that come from the transfer process. 
