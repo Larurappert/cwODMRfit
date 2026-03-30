@@ -5,7 +5,7 @@ This code has the Python code I used to analyse cw ODMR spectra of NV ensembles 
 
 The script fits the ODMR dips with a double-Voigt model and extracts the central frequency shift and the splitting. From that, effective axial and transverse strain values are calculated.
 
-For every waveguide the exakt Position (from 0-50 Mikrometer) hast to be put in the Code, so that the before after positions can be matched. The position gets extracted from the folder name P X, with X being the position number between 1 and 5. The dBM Power is automatically extracted from the file name. 
+For every waveguide the exakt Position (from 0-50 Mikrometer) hast to be put in the Code, so that the before and after positions can be matched. The position gets extracted from the folder name Po X, with X being the position number between 1 and 5. The dBm Power is automatically extracted from the file name. 
 
 The fitting is set up to be with automatic peak detection, sensible parameter limits, and simple quality checks. 
 
